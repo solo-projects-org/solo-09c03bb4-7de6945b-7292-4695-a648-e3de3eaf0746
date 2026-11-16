@@ -1,0 +1,20 @@
+services:
+  downtime-api:
+    build: .
+    image: downtime-report-api:1.0.0
+    container_name: downtime-report-api
+    ports:
+      - "8000:8000"
+    environment:
+      DOWNTIME_DB_PATH: /data/gateway.db
+    volumes:
+      - gateway-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  gateway-data:
