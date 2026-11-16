@@ -14,10 +14,15 @@ from . import service
 from .db import init_db
 from .models import (
     BatchEventResult,
+    BatchSampleResult,
     EventAck,
     EventIn,
     EventRecord,
     ReportEnvelope,
+    SampleAck,
+    SampleIn,
+    SampleRecord,
+    VerificationEnvelope,
 )
 
 
@@ -28,11 +33,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="设备网关停机日报服务",
-    version="1.0.0",
+    title="设备网关停机日报与采样核验服务",
+    version="1.1.0",
     description=(
         "接收设备网关运行/停机切换事件（含修订号裁决），按 UTC 00:00/08:00/16:00 "
         "三班生成停机区间日报；更正旧事件时受影响日报自动失效，重算后恢复。"
+        "另接收网关独立上报的状态采样（同号同文幂等、同号异文拒收），"
+        "按设备 + UTC 日期对照生效事件时序发布核验，列出冲突采样号、双方状态及依据事件号。"
     ),
     lifespan=lifespan,
 )
@@ -109,3 +116,77 @@ def list_all_reports(
 ):
     """列出已生成日报（含 CURRENT / INVALIDATED 全部状态）。"""
     return service.list_reports(device_id)
+
+
+# --------------------------------------------------------------------------- #
+# 独立状态采样
+# --------------------------------------------------------------------------- #
+@app.post("/samples", response_model=SampleAck, tags=["采样"], status_code=201)
+def submit_sample(sample: SampleIn):
+    """提交一条网关独立上报的状态采样。
+
+    - 同号同文重复提交幂等（idempotent=true，版号不增）；
+    - 同号异文返回 409；
+    - 新采样会使其 UTC 日期上已发布的核验失效，需重算。
+    """
+    try:
+        return service.submit_sample(sample.model_dump())
+    except service.ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post(
+    "/samples/batch", response_model=BatchSampleResult, tags=["采样"], status_code=201
+)
+def submit_samples_batch(samples: list[SampleIn]):
+    """批量提交采样：整批同一事务，任一冲突全部回滚。"""
+    try:
+        return service.submit_samples_batch([s.model_dump() for s in samples])
+    except service.ConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/devices/{device_id}/samples", response_model=list[SampleRecord], tags=["采样"])
+def list_device_samples(device_id: str):
+    """查看某设备收到的全部采样（按采样时刻排序）。"""
+    return service.list_samples(device_id)
+
+
+# --------------------------------------------------------------------------- #
+# 采样核验
+# --------------------------------------------------------------------------- #
+@app.get(
+    "/devices/{device_id}/verifications/{check_date}",
+    response_model=VerificationEnvelope,
+    tags=["核验"],
+)
+def get_verification(
+    device_id: str,
+    check_date: date,
+    recompute: bool = Query(
+        False, description="true 时强制按当前两路数据版号重算（失效核验恢复为 CURRENT）"
+    ),
+):
+    """按设备 + UTC 日期发布采样核验。
+
+    - 按生效事件时序对照当日每条采样，列出冲突采样号、采样/事件双方状态及依据事件号；
+    - 首次切换之前的采样记 UNKNOWN；
+    - 无采样的日期返回 NO_SAMPLES 且 verified=false，绝不标为已核验；
+    - 采样补传或事件追溯更正后，受影响日期的旧核验 INVALIDATED，重算后恢复；
+    - 未受影响的日期保持 CURRENT，继续可用。
+    """
+    day = check_date.isoformat()
+    try:
+        if recompute:
+            return service.recompute_check(device_id, day)
+        return service.get_or_create_check(device_id, day)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/verifications", response_model=list[VerificationEnvelope], tags=["核验"])
+def list_all_verifications(
+    device_id: str | None = Query(None, description="可选，按设备过滤"),
+):
+    """列出已发布核验（含 CURRENT / INVALIDATED 全部状态）。"""
+    return service.list_checks(device_id)

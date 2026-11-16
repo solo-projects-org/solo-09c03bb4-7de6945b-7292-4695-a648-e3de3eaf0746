@@ -52,8 +52,25 @@ CREATE TABLE IF NOT EXISTS event_revisions (
     UNIQUE (device_id, event_id, revision)
 );
 
--- 每个设备的数据版号：每次“接受”一条新事件修订 +1（同版同文幂等不增版）
+-- 每个设备的事件数据版号：每次“接受”一条新事件修订 +1（同版同文幂等不增版）
 CREATE TABLE IF NOT EXISTS device_versions (
+    device_id      TEXT PRIMARY KEY,
+    current_version INTEGER NOT NULL DEFAULT 0
+);
+
+-- 网关独立上报的状态采样：同一设备内采样号唯一。
+-- 采样不设修订号：同号同文幂等，同号异文直接拒收。
+CREATE TABLE IF NOT EXISTS samples (
+    device_id     TEXT NOT NULL,
+    sample_id     TEXT NOT NULL,
+    sample_time   TEXT NOT NULL,          -- UTC ISO-8601
+    status        TEXT NOT NULL CHECK (status IN ('RUNNING', 'STOPPED')),
+    received_at   TEXT NOT NULL,
+    PRIMARY KEY (device_id, sample_id)
+);
+
+-- 每个设备的采样数据版号：每次“接受”一条新采样 +1（同号同文幂等不增版）
+CREATE TABLE IF NOT EXISTS sample_versions (
     device_id      TEXT PRIMARY KEY,
     current_version INTEGER NOT NULL DEFAULT 0
 );
@@ -75,6 +92,26 @@ CREATE INDEX IF NOT EXISTS idx_event_rev_lookup
     ON event_revisions (device_id, event_id, revision);
 CREATE INDEX IF NOT EXISTS idx_event_time
     ON event_revisions (device_id, event_time);
+
+CREATE INDEX IF NOT EXISTS idx_sample_time
+    ON samples (device_id, sample_time);
+
+-- 每设备每 UTC 日期的采样核查结果；两份来源版号缺一不可
+CREATE TABLE IF NOT EXISTS sample_checks (
+    device_id           TEXT NOT NULL,
+    check_date          TEXT NOT NULL,     -- YYYY-MM-DD（UTC）
+    event_version       INTEGER NOT NULL,  -- 事件数据版号
+    sample_version      INTEGER NOT NULL,  -- 采样数据版号
+    status              TEXT NOT NULL CHECK (status IN ('CURRENT', 'INVALIDATED')),
+    content             TEXT NOT NULL,
+    generated_at        TEXT NOT NULL,
+    invalidated_at      TEXT,
+    invalidated_reason  TEXT,
+    PRIMARY KEY (device_id, check_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_check_status
+    ON sample_checks (device_id, status);
 
 -- 每个事件当前生效修订（同版异文被拒收，因此同 revision 只有一行）
 CREATE VIEW IF NOT EXISTS latest_events AS
